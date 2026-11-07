@@ -3,7 +3,13 @@
 netease-ncm2mp3 — 网易云音乐 .ncm 转 MP3 图形工具
 
 把你自己在网易云客户端下载的 .ncm 文件转换成标准 MP3（或保留无损 FLAC）。
+
+用法：
+    python app.py                      # 打开图形界面
+    python app.py --cli a.ncm b.ncm    # 命令行批量转换
+    python app.py --cli 某文件夹 --out 输出目录 --bitrate 320k
 """
+import argparse
 import os
 import queue
 import subprocess
@@ -18,7 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 import core
 
 APP_NAME = "netease-ncm2mp3"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 BITRATES = [("128 kbps（体积小）", "128k"),
             ("192 kbps（推荐）", "192k"),
@@ -28,79 +34,268 @@ NAME_TPL = [("歌手 - 歌名", "artist_title"),
             ("沿用原文件名", "origin")]
 
 
+# ---------------------------------------------------------------------------
+# 共用：单个文件转换
+# ---------------------------------------------------------------------------
+def collect_inputs(paths, recursive=True):
+    """把「文件 / 文件夹」混合列表展开成待处理文件列表。"""
+    out = []
+    for p in paths:
+        p = os.path.abspath(p)
+        if os.path.isdir(p):
+            if recursive:
+                for root, _, names in os.walk(p):
+                    for n in names:
+                        if n.lower().endswith(core.AUDIO_EXTS) and not n.startswith("~"):
+                            out.append(os.path.join(root, n))
+            else:
+                for n in os.listdir(p):
+                    fp = os.path.join(p, n)
+                    if os.path.isfile(fp) and n.lower().endswith(core.AUDIO_EXTS):
+                        out.append(fp)
+        elif os.path.isfile(p):
+            out.append(p)
+    seen, uniq = set(), []
+    for p in out:
+        k = os.path.normcase(p)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
+
+
+def parse_meta(meta, path):
+    """从 ncm 元数据里取标题/歌手/专辑，缺失则从文件名推断。"""
+    title = meta.get("musicName") or ""
+    artists = meta.get("artist") or []
+    if isinstance(artists, list):
+        artist = "、".join(a[0] if isinstance(a, (list, tuple)) and a else str(a) for a in artists)
+    else:
+        artist = str(artists)
+    album = meta.get("album") or ""
+    if not title:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        parts = stem.split(" - ", 1)
+        if len(parts) == 2:
+            artist = artist or parts[0]
+            title = parts[1]
+        else:
+            title = stem
+    return title, artist, album
+
+
+def build_target_name(path, title, artist, naming):
+    if naming == "artist_title" and artist:
+        base = f"{artist} - {title}"
+    elif naming == "title_artist" and artist:
+        base = f"{title} - {artist}"
+    else:
+        base = os.path.splitext(os.path.basename(path))[0]
+    return core.safe_filename(base)
+
+
+def convert_file(path, out_dir=None, bitrate="192k", naming="artist_title",
+                 skip_existing=True, cover=False, progress=None):
+    """
+    转换单个文件。返回 (状态, 信息)：状态 ∈ {"ok", "skip", "fail"}。
+    """
+    tmpd = None
+    try:
+        raw = path
+        meta = {}
+        if path.lower().endswith(".ncm"):
+            tmpd = tempfile.mkdtemp(prefix="ncm2mp3_")
+            raw = os.path.join(tmpd, "raw.bin")
+            cover_path = None
+            if cover:
+                cover_path = os.path.join(tmpd, "cover.bin")
+            meta = core.decrypt_ncm(path, raw, progress=progress, cover_path=cover_path)
+            fmt = core.sniff_audio(open(raw, "rb").read(64))
+        else:
+            fmt = core.sniff_audio(open(path, "rb").read(64))
+
+        if fmt == "unknown":
+            return "fail", "无法识别的音频格式"
+
+        keep_lossless = (bitrate == "lossless")
+        title, artist, album = parse_meta(meta, path)
+        base = build_target_name(path, title, artist, naming)
+
+        target_dir = out_dir or os.path.dirname(path)
+        os.makedirs(target_dir, exist_ok=True)
+        ext = ".flac" if keep_lossless else ".mp3"
+        out_path = os.path.join(target_dir, base + ext)
+        if skip_existing and os.path.exists(out_path):
+            return "skip", "已存在，跳过"
+        k = 2
+        while os.path.exists(out_path) and not skip_existing:
+            out_path = os.path.join(target_dir, f"{base} ({k}){ext}")
+            k += 1
+
+        ok, err = core.encode(raw, out_path,
+                              {"title": title, "artist": artist, "album": album},
+                              bitrate="192k" if keep_lossless else bitrate,
+                              keep_lossless=keep_lossless)
+        if not ok:
+            return "fail", err or "ffmpeg 转码失败"
+
+        # 封面同目录导出
+        if cover and meta.get("_cover") and os.path.exists(meta["_cover"]):
+            with open(meta["_cover"], "rb") as f:
+                head = f.read(8)
+            cext = ".png" if head.startswith(b"\x89PNG") else ".jpg"
+            try:
+                os.replace(meta["_cover"], os.path.join(target_dir, base + cext))
+            except OSError:
+                pass
+
+        size = os.path.getsize(out_path) / 1048576
+        return "ok", f"完成 · {size:.1f} MB"
+    except Exception as e:
+        return "fail", str(e)
+    finally:
+        if tmpd:
+            for n in os.listdir(tmpd):
+                try:
+                    os.remove(os.path.join(tmpd, n))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmpd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# 命令行
+# ---------------------------------------------------------------------------
+def cli_main(argv):
+    try:                      # Windows 控制台默认 GBK，中文/符号会炸，统一改 UTF-8
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="网易云 .ncm 转 MP3（批量）")
+    ap.add_argument("inputs", nargs="+", help="文件或文件夹")
+    ap.add_argument("-o", "--out", default=None, help="输出目录（默认与源文件同目录）")
+    ap.add_argument("-b", "--bitrate", default="192k",
+                    choices=["128k", "192k", "320k", "lossless"], help="输出码率；lossless=保留 FLAC")
+    ap.add_argument("-j", "--jobs", type=int, default=max(2, min(8, os.cpu_count() or 4)),
+                    help="并行数")
+    ap.add_argument("-n", "--naming", default="artist_title",
+                    choices=[n[1] for n in NAME_TPL], help="命名方式")
+    ap.add_argument("--no-skip", action="store_true", help="不跳过已存在的文件")
+    ap.add_argument("--cover", action="store_true", help="同时导出封面图")
+    ap.add_argument("--no-recursive", action="store_true", help="文件夹不递归")
+    ap.add_argument("-v", "--version", action="version", version=f"{APP_NAME} {VERSION}")
+    args = ap.parse_args(argv)
+
+    files = collect_inputs(args.inputs, recursive=not args.no_recursive)
+    if not files:
+        print("没有找到可处理的文件")
+        return 2
+
+    print(f"待处理 {len(files)} 个文件，并行 {args.jobs}")
+    ok = skip = fail = 0
+    t0 = time.time()
+
+    def work(p):
+        return p, convert_file(p, args.out, args.bitrate, args.naming,
+                               skip_existing=not args.no_skip, cover=args.cover)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        for p, (status, msg) in pool.map(work, files):
+            name = os.path.basename(p)
+            if status == "ok":
+                ok += 1
+                print(f"  ✔ {name}  {msg}")
+            elif status == "skip":
+                skip += 1
+                print(f"  - {name}  {msg}")
+            else:
+                fail += 1
+                print(f"  ✘ {name}  {msg}")
+    print(f"\n完成：成功 {ok}，跳过 {skip}，失败 {fail}，用时 {time.time()-t0:.1f}s")
+    return 0 if fail == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# 图形界面
+# ---------------------------------------------------------------------------
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.files = []                 # [(路径, 状态)]
+        self.files = []
         self.queue = queue.Queue()
         self.stop_flag = threading.Event()
         self.running = False
-        self.ok = self.fail = self.skip = 0
 
         root.title(f"{APP_NAME} {VERSION}   ·   网易云 .ncm → MP3")
-        root.geometry("900x640")
-        root.minsize(760, 520)
+        root.geometry("920x660")
+        root.minsize(780, 540)
         self._build_ui()
         self.root.after(100, self._drain_queue)
         self._check_ffmpeg()
 
-    # ---------------- UI ----------------
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
         top = ttk.Frame(self.root)
         top.pack(fill="x", **pad)
-
         ttk.Button(top, text="添加文件", command=self.add_files).pack(side="left")
         ttk.Button(top, text="添加文件夹", command=self.add_folder).pack(side="left", padx=4)
         ttk.Button(top, text="移除选中", command=self.remove_selected).pack(side="left")
         ttk.Button(top, text="清空", command=self.clear).pack(side="left", padx=4)
-
         self.lbl_count = ttk.Label(top, text="共 0 个文件")
         self.lbl_count.pack(side="right")
 
-        # 文件列表
         mid = ttk.Frame(self.root)
         mid.pack(fill="both", expand=True, **pad)
-        cols = ("name", "status")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=12)
+        self.tree = ttk.Treeview(mid, columns=("name", "status"), show="headings", height=12)
         self.tree.heading("name", text="文件")
         self.tree.heading("status", text="状态")
-        self.tree.column("name", width=640, anchor="w")
-        self.tree.column("status", width=150, anchor="center")
+        self.tree.column("name", width=650, anchor="w")
+        self.tree.column("status", width=170, anchor="center")
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # 设置区
         opt = ttk.LabelFrame(self.root, text="输出设置")
         opt.pack(fill="x", **pad)
-
         row1 = ttk.Frame(opt)
         row1.pack(fill="x", padx=8, pady=6)
         ttk.Label(row1, text="输出目录：").pack(side="left")
         self.var_outdir = tk.StringVar(value="")
         ttk.Entry(row1, textvariable=self.var_outdir).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(row1, text="选择…", command=self.choose_outdir).pack(side="left")
-        ttk.Button(row1, text="与源文件同目录", command=lambda: self.var_outdir.set("")).pack(side="left", padx=4)
+        ttk.Button(row1, text="与源同目录",
+                   command=lambda: self.var_outdir.set("")).pack(side="left", padx=4)
 
         row2 = ttk.Frame(opt)
         row2.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Label(row2, text="输出格式：").pack(side="left")
         self.var_fmt = tk.StringVar(value=BITRATES[1][0])
-        ttk.Combobox(row2, textvariable=self.var_fmt, values=[b[0] for b in BITRATES],
-                     state="readonly", width=20).pack(side="left", padx=(0, 14))
-        ttk.Label(row2, text="命名方式：").pack(side="left")
+        ttk.Combobox(row2, textvariable=self.var_fmt,
+                     values=[b[0] for b in BITRATES], state="readonly",
+                     width=20).pack(side="left", padx=(0, 12))
+        ttk.Label(row2, text="命名：").pack(side="left")
         self.var_name = tk.StringVar(value=NAME_TPL[0][0])
-        ttk.Combobox(row2, textvariable=self.var_name, values=[n[0] for n in NAME_TPL],
-                     state="readonly", width=18).pack(side="left", padx=(0, 14))
+        ttk.Combobox(row2, textvariable=self.var_name,
+                     values=[n[0] for n in NAME_TPL], state="readonly",
+                     width=16).pack(side="left", padx=(0, 12))
         ttk.Label(row2, text="并行：").pack(side="left")
-        self.var_jobs = tk.IntVar(value=max(2, min(8, (os.cpu_count() or 4))))
-        ttk.Spinbox(row2, from_=1, to=16, textvariable=self.var_jobs, width=5).pack(side="left")
+        self.var_jobs = tk.IntVar(value=max(2, min(8, os.cpu_count() or 4)))
+        ttk.Spinbox(row2, from_=1, to=16, textvariable=self.var_jobs,
+                    width=5).pack(side="left", padx=(0, 12))
         self.var_skip = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="跳过已存在", variable=self.var_skip).pack(side="left", padx=12)
+        ttk.Checkbutton(row2, text="跳过已存在",
+                        variable=self.var_skip).pack(side="left")
+        self.var_cover = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="导出封面",
+                        variable=self.var_cover).pack(side="left", padx=10)
 
-        # 操作区
         act = ttk.Frame(self.root)
         act.pack(fill="x", **pad)
         self.btn_start = ttk.Button(act, text="开始转换", command=self.start)
@@ -112,7 +307,6 @@ class App:
         self.lbl_stat = ttk.Label(act, text="就绪")
         self.lbl_stat.pack(side="left")
 
-        # 日志
         logf = ttk.LabelFrame(self.root, text="日志")
         logf.pack(fill="both", expand=False, **pad)
         self.log = tk.Text(logf, height=9, state="disabled", wrap="none")
@@ -131,7 +325,7 @@ class App:
         except Exception:
             self.write_log("⚠ 未找到 ffmpeg，转 MP3 会失败。请把 ffmpeg.exe 放到本程序同目录。")
 
-    # ---------------- 列表操作 ----------------
+    # --- 列表 ---
     def _refresh(self):
         self.tree.delete(*self.tree.get_children())
         for p, st in self.files:
@@ -141,23 +335,19 @@ class App:
     def add_files(self):
         paths = filedialog.askopenfilenames(
             title="选择 .ncm 或音频文件",
-            filetypes=[("网易云音乐", "*.ncm"), ("音频文件", "*.flac *.mp3 *.m4a *.wav *.aac *.ogg"),
+            filetypes=[("网易云音乐", "*.ncm"),
+                       ("音频文件", "*.flac *.mp3 *.m4a *.wav *.aac *.ogg"),
                        ("所有文件", "*.*")])
         self._add(list(paths))
 
     def add_folder(self):
         d = filedialog.askdirectory(title="选择包含 .ncm 的文件夹")
-        if not d:
-            return
-        found = []
-        for root, _, names in os.walk(d):
-            for n in names:
-                if n.lower().endswith(core.AUDIO_EXTS):
-                    found.append(os.path.join(root, n))
-        if not found:
-            messagebox.showinfo("提示", "该文件夹里没有找到音频文件。")
-            return
-        self._add(found)
+        if d:
+            found = collect_inputs([d])
+            if not found:
+                messagebox.showinfo("提示", "该文件夹里没有找到音频文件。")
+                return
+            self._add(found)
 
     def _add(self, paths):
         exist = {p for p, _ in self.files}
@@ -167,26 +357,24 @@ class App:
         self._refresh()
 
     def remove_selected(self):
-        sel = self.tree.selection()
-        if not sel:
+        if self.running:
             return
-        idx = sorted((self.tree.index(i) for i in sel), reverse=True)
-        for i in idx:
+        sel = self.tree.selection()
+        for i in sorted((self.tree.index(x) for x in sel), reverse=True):
             self.files.pop(i)
         self._refresh()
 
     def clear(self):
-        if self.running:
-            return
-        self.files.clear()
-        self._refresh()
+        if not self.running:
+            self.files.clear()
+            self._refresh()
 
     def choose_outdir(self):
         d = filedialog.askdirectory(title="选择输出目录")
         if d:
             self.var_outdir.set(d)
 
-    # ---------------- 转换 ----------------
+    # --- 转换 ---
     def start(self):
         if self.running or not self.files:
             return
@@ -194,126 +382,68 @@ class App:
         if out_dir and not os.path.isdir(out_dir):
             messagebox.showerror("错误", "输出目录不存在。")
             return
-
-        bitrate = dict(BITRATES)[self.var_fmt.get()]
-        naming = dict(NAME_TPL)[self.var_name.get()]
-        jobs = max(1, int(self.var_jobs.get()))
-        skip = self.var_skip.get()
-
         self.running = True
         self.stop_flag.clear()
-        self.ok = self.fail = self.skip = 0
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.progress["value"] = 0
-
-        todo = list(enumerate(self.files))
-        threading.Thread(target=self._worker, args=(todo, out_dir, bitrate, naming, jobs, skip),
-                         daemon=True).start()
+        opts = dict(out_dir=out_dir or None,
+                    bitrate=dict(BITRATES)[self.var_fmt.get()],
+                    naming=dict(NAME_TPL)[self.var_name.get()],
+                    skip_existing=self.var_skip.get(),
+                    cover=self.var_cover.get(),
+                    jobs=max(1, int(self.var_jobs.get())))
+        threading.Thread(target=self._worker, args=(opts,), daemon=True).start()
 
     def stop(self):
         self.stop_flag.set()
         self.write_log("正在停止…")
 
-    def _worker(self, todo, out_dir, bitrate, naming, jobs, skip):
+    def _worker(self, opts):
+        files = list(self.files)
+        total = len(files)
         t0 = time.time()
-        done = 0
-        total = len(todo)
+        ok = skip = fail = 0
+        jobs = opts.pop("jobs")
 
-        def one(item):
-            idx, (path, _status) = item
+        def one(idx_path):
+            idx, path = idx_path
             if self.stop_flag.is_set():
-                return idx, path, "已取消", None
-            try:
-                self.queue.put(("status", idx, "解密中…"))
-                tmpd = tempfile.mkdtemp(prefix="ncm2mp3_")
-                raw = os.path.join(tmpd, "raw.bin")
-                meta = {}
-                if path.lower().endswith(".ncm"):
-                    meta = core.decrypt_ncm(path, raw)
-                    fmt = core.sniff_audio(open(raw, "rb").read(64))
-                else:
-                    raw = path
-                    fmt = core.sniff_audio(open(path, "rb").read(64))
-                if fmt == "unknown":
-                    raise ValueError("无法识别的音频格式")
-
-                title = meta.get("musicName") or ""
-                artists = meta.get("artist") or []
-                if isinstance(artists, list):
-                    artist = "、".join(a[0] if isinstance(a, (list, tuple)) and a else str(a)
-                                      for a in artists)
-                else:
-                    artist = str(artists)
-                if not title:
-                    stem = os.path.splitext(os.path.basename(path))[0]
-                    parts = stem.split(" - ", 1)
-                    if len(parts) == 2:
-                        artist = artist or parts[0]
-                        title = parts[1]
-                    else:
-                        title = stem
-
-                if naming == "artist_title" and artist:
-                    base = f"{artist} - {title}"
-                elif naming == "title_artist" and artist:
-                    base = f"{title} - {artist}"
-                else:
-                    base = os.path.splitext(os.path.basename(path))[0]
-                base = core.safe_filename(base)
-
-                target_dir = out_dir or os.path.dirname(path)
-                os.makedirs(target_dir, exist_ok=True)
-                out_path = os.path.join(target_dir, base + ".mp3")
-                if skip and os.path.exists(out_path):
-                    return idx, path, "已存在，跳过", None
-                k = 2
-                while os.path.exists(out_path) and not skip:
-                    out_path = os.path.join(target_dir, f"{base} ({k}).mp3")
-                    k += 1
-
-                self.queue.put(("status", idx, "转码中…"))
-                ok, err = core.encode(raw, out_path, meta, bitrate)
-                if raw != path and os.path.exists(raw):
-                    try:
-                        os.remove(raw)
-                    except OSError:
-                        pass
-                try:
-                    os.rmdir(tmpd)
-                except Exception:
-                    pass
-                if not ok:
-                    raise RuntimeError(err or "ffmpeg 转码失败")
-                return idx, path, f"完成 · {os.path.getsize(out_path)/1048576:.1f} MB", None
-            except Exception as e:
-                return idx, path, "失败：" + str(e), str(e)
+                return idx, "已取消"
+            self.queue.put(("status", idx, "处理中…"))
+            status, msg = convert_file(path, **opts)
+            if status == "ok":
+                return idx, msg
+            if status == "skip":
+                return idx, "已存在，跳过"
+            return idx, "失败：" + msg
 
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for idx, path, status, err in pool.map(one, todo):
-                done += 1
+            for done, (idx, status) in enumerate(pool.map(one, list(enumerate(files))), 1):
                 if status.startswith("完成"):
-                    self.ok += 1
+                    ok += 1
                 elif status.startswith("已存在"):
-                    self.skip += 1
+                    skip += 1
                 elif status.startswith("已取消"):
                     pass
                 else:
-                    self.fail += 1
+                    fail += 1
                 self.queue.put(("done", idx, status))
                 self.queue.put(("progress", done * 100 // max(1, total)))
-                if self.stop_flag.is_set():
-                    pass
 
-        elapsed = time.time() - t0
-        self.queue.put(("finish", self.ok, self.fail, self.skip, elapsed))
+        self.queue.put(("finish", ok, fail, skip, time.time() - t0))
 
-    # ---------------- 队列 ----------------
+    # --- 队列 ---
     def write_log(self, text):
         self.log.config(state="normal")
         self.log.insert("end", text + "\n")
         self.log.see("end")
         self.log.config(state="disabled")
+
+    def _set_status(self, idx, st):
+        kids = self.tree.get_children()
+        if 0 <= idx < len(kids):
+            self.tree.set(kids[idx], "status", st)
 
     def _drain_queue(self):
         try:
@@ -322,14 +452,10 @@ class App:
                 kind = msg[0]
                 if kind == "status":
                     _, idx, st = msg
-                    if idx < len(self.tree.get_children()):
-                        iid = self.tree.get_children()[idx]
-                        self.tree.set(iid, "status", st)
+                    self._set_status(idx, st)
                 elif kind == "done":
                     _, idx, st = msg
-                    if idx < len(self.tree.get_children()):
-                        iid = self.tree.get_children()[idx]
-                        self.tree.set(iid, "status", st)
+                    self._set_status(idx, st)
                     name = os.path.basename(self.files[idx][0]) if idx < len(self.files) else ""
                     self.write_log(f"[{st}] {name}")
                 elif kind == "progress":
@@ -348,15 +474,21 @@ class App:
 
 
 def main():
+    argv = sys.argv[1:]
+    if "--cli" in argv:
+        return cli_main([a for a in argv if a != "--cli"])
     root = tk.Tk()
     try:
         style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        for theme in ("vista", "winnative", "clam"):
+            if theme in style.theme_names():
+                style.theme_use(theme)
+                break
     except Exception:
         pass
     App(root)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":

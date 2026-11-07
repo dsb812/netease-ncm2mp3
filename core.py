@@ -20,7 +20,8 @@ from Crypto.Cipher import AES
 MAGIC = b"CTENFDAM"
 CORE_KEY = bytes.fromhex("687A4852416D736F356B496E62617857")
 META_KEY = bytes.fromhex("2331346C6A6B5F215C5D2630553C2728")
-KEYBOX_PERIOD = 0x8000          # 密钥流以 32 KB 为周期
+KEYBOX_PERIOD = 0x8000          # 数据按 32 KB 分块读取
+KS_PERIOD = 256                 # 密钥流的真实周期（j = (i+1) & 0xFF）
 AUDIO_EXTS = (".ncm", ".flac", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".wma")
 
 
@@ -111,7 +112,7 @@ def _build_keybox(key_data: bytes) -> bytearray:
     return box
 
 
-def _keystream(box: bytearray, length: int = KEYBOX_PERIOD) -> bytes:
+def _keystream(box: bytearray, length: int = KS_PERIOD) -> bytes:
     out = bytearray(length)
     for i in range(length):
         j = (i + 1) & 0xFF
@@ -119,9 +120,11 @@ def _keystream(box: bytearray, length: int = KEYBOX_PERIOD) -> bytes:
     return bytes(out)
 
 
-def decrypt_ncm(path: str, out_raw: str, progress=None) -> dict:
+def decrypt_ncm(path: str, out_raw: str, progress=None, cover_path: str = None) -> dict:
     """
     把 .ncm 解密成原始音频文件（FLAC / MP3），返回元数据字典。
+
+    cover_path: 若给出路径，则把内嵌封面图写出来（自动补 .jpg/.png 后缀由调用方决定）。
     """
     with open(path, "rb") as f:
         if f.read(8) != MAGIC:
@@ -148,17 +151,22 @@ def decrypt_ncm(path: str, out_raw: str, progress=None) -> dict:
         f.read(5)                                   # 间隔
         img_len = struct.unpack("<I", f.read(4))[0]
         if img_len:
-            f.read(img_len)
+            img = f.read(img_len)
+            if cover_path:
+                try:
+                    with open(cover_path, "wb") as cf:
+                        cf.write(img)
+                    meta["_cover"] = cover_path
+                except OSError:
+                    pass
 
         total = os.path.getsize(path)
-        written = 0
         with open(out_raw, "wb") as out:
             while True:
                 chunk = f.read(KEYBOX_PERIOD)
                 if not chunk:
                     break
                 out.write(_xor_fast(chunk, ks))
-                written += len(chunk)
                 if progress and total:
                     progress(min(f.tell(), total) / total)
     return meta
