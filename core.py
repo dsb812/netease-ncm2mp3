@@ -11,6 +11,7 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 
@@ -167,9 +168,23 @@ def decrypt_ncm(path: str, out_raw: str, progress=None) -> dict:
 # ffmpeg 封装
 # --------------------------------------------------------------------------
 def find_ffmpeg() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
+    """依次在：程序所在目录 / bin 子目录 / 打包临时目录 / 当前目录 / PATH 里找 ffmpeg。"""
     names = ["ffmpeg.exe", "ffmpeg"] if os.name == "nt" else ["ffmpeg"]
-    for d in (here, os.path.join(here, "bin"), os.getcwd()):
+    dirs = []
+    for base in (os.path.dirname(os.path.abspath(__file__)),
+                 getattr(sys, "_MEIPASS", None),
+                 os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None,
+                 os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else None,
+                 os.getcwd()):
+        if not base:
+            continue
+        dirs.append(base)
+        dirs.append(os.path.join(base, "bin"))
+    seen = set()
+    for d in dirs:
+        if d in seen:
+            continue
+        seen.add(d)
         for n in names:
             p = os.path.join(d, n)
             if os.path.isfile(p):
