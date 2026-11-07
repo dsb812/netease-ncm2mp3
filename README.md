@@ -4,6 +4,14 @@
 
 > 本工具只做「本地文件格式转换」，不包含任何绕过付费、会员或版权限制的功能。请仅用于转换你合法获取的音乐。
 
+## 下载
+
+不想装 Python 的话，直接下打包好的 Windows 版：
+
+**[⬇ netease-ncm2mp3-win64.zip](https://github.com/dsb812/netease-ncm2mp3/releases/latest/download/netease-ncm2mp3-win64.zip)**
+
+解压后双击 `netease-ncm2mp3.exe`（`ffmpeg.exe` 要和它放在同一目录，压缩包里已附带）。
+
 ## 功能
 
 - 拖入 `.ncm` / `.flac` / `.mp3` / `.m4a` 等文件，或直接选一整个文件夹（递归扫描）
