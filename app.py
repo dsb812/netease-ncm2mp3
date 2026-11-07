@@ -95,7 +95,7 @@ def build_target_name(path, title, artist, naming):
 
 
 def convert_file(path, out_dir=None, bitrate="192k", naming="artist_title",
-                 skip_existing=True, cover=False, progress=None):
+                 skip_existing=True, cover=False, embed_cover=False, progress=None):
     """
     转换单个文件。返回 (状态, 信息)：状态 ∈ {"ok", "skip", "fail"}。
     """
@@ -103,11 +103,11 @@ def convert_file(path, out_dir=None, bitrate="192k", naming="artist_title",
     try:
         raw = path
         meta = {}
+        cover_path = None
         if path.lower().endswith(".ncm"):
             tmpd = tempfile.mkdtemp(prefix="ncm2mp3_")
             raw = os.path.join(tmpd, "raw.bin")
-            cover_path = None
-            if cover:
+            if cover or embed_cover:
                 cover_path = os.path.join(tmpd, "cover.bin")
             meta = core.decrypt_ncm(path, raw, progress=progress, cover_path=cover_path)
             fmt = core.sniff_audio(open(raw, "rb").read(64))
@@ -135,17 +135,18 @@ def convert_file(path, out_dir=None, bitrate="192k", naming="artist_title",
         ok, err = core.encode(raw, out_path,
                               {"title": title, "artist": artist, "album": album},
                               bitrate="192k" if keep_lossless else bitrate,
-                              keep_lossless=keep_lossless)
+                              keep_lossless=keep_lossless,
+                              cover_path=cover_path if embed_cover else None)
         if not ok:
             return "fail", err or "ffmpeg 转码失败"
 
-        # 封面同目录导出
-        if cover and meta.get("_cover") and os.path.exists(meta["_cover"]):
-            with open(meta["_cover"], "rb") as f:
+        # 封面另存到输出目录
+        if cover and cover_path and os.path.exists(cover_path):
+            with open(cover_path, "rb") as f:
                 head = f.read(8)
             cext = ".png" if head.startswith(b"\x89PNG") else ".jpg"
             try:
-                os.replace(meta["_cover"], os.path.join(target_dir, base + cext))
+                os.replace(cover_path, os.path.join(target_dir, base + cext))
             except OSError:
                 pass
 
@@ -188,6 +189,7 @@ def cli_main(argv):
                     choices=[n[1] for n in NAME_TPL], help="命名方式")
     ap.add_argument("--no-skip", action="store_true", help="不跳过已存在的文件")
     ap.add_argument("--cover", action="store_true", help="同时导出封面图")
+    ap.add_argument("--embed-cover", action="store_true", help="把封面嵌入 MP3")
     ap.add_argument("--no-recursive", action="store_true", help="文件夹不递归")
     ap.add_argument("-v", "--version", action="version", version=f"{APP_NAME} {VERSION}")
     args = ap.parse_args(argv)
@@ -203,7 +205,8 @@ def cli_main(argv):
 
     def work(p):
         return p, convert_file(p, args.out, args.bitrate, args.naming,
-                               skip_existing=not args.no_skip, cover=args.cover)
+                               skip_existing=not args.no_skip, cover=args.cover,
+                               embed_cover=args.embed_cover)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         for p, (status, msg) in pool.map(work, files):
@@ -294,7 +297,10 @@ class App:
                         variable=self.var_skip).pack(side="left")
         self.var_cover = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="导出封面",
-                        variable=self.var_cover).pack(side="left", padx=10)
+                        variable=self.var_cover).pack(side="left", padx=6)
+        self.var_embed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="嵌入封面",
+                        variable=self.var_embed).pack(side="left")
 
         act = ttk.Frame(self.root)
         act.pack(fill="x", **pad)
@@ -392,6 +398,7 @@ class App:
                     naming=dict(NAME_TPL)[self.var_name.get()],
                     skip_existing=self.var_skip.get(),
                     cover=self.var_cover.get(),
+                    embed_cover=self.var_embed.get(),
                     jobs=max(1, int(self.var_jobs.get())))
         threading.Thread(target=self._worker, args=(opts,), daemon=True).start()
 

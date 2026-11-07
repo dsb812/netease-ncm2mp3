@@ -201,14 +201,24 @@ def find_ffmpeg() -> str:
 
 
 def encode(raw_path: str, out_path: str, meta: dict, bitrate: str = "192k",
-           keep_lossless: bool = False, progress=None) -> tuple:
-    """把解密出的原始音频转成目标格式。返回 (成功?, 错误信息)"""
+           keep_lossless: bool = False, cover_path: str = None) -> tuple:
+    """
+    把解密出的原始音频转成目标格式。返回 (成功?, 错误信息)
+
+    cover_path: 若给出且输出为 MP3，会把图片作为封面（attached_pic）嵌进去。
+    """
     if keep_lossless:
         if os.path.splitext(raw_path)[1].lower() == os.path.splitext(out_path)[1].lower():
             os.replace(raw_path, out_path)
             return True, ""
     cmd = [find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
-           "-i", raw_path, "-vn", "-map_metadata", "-1"]
+           "-i", raw_path]
+    embed = bool(cover_path) and not keep_lossless and os.path.isfile(cover_path or "")
+    if embed:
+        cmd += ["-i", cover_path]
+    cmd += ["-map", "0:a", "-map_metadata", "-1"]
+    if embed:
+        cmd += ["-map", "1:v", "-c:v", "copy", "-disposition:v", "attached_pic"]
     if not keep_lossless:
         cmd += ["-c:a", "libmp3lame", "-b:a", bitrate, "-ar", "44100"]
     if meta.get("title"):
@@ -221,5 +231,7 @@ def encode(raw_path: str, out_path: str, meta: dict, bitrate: str = "192k",
     r = subprocess.run(cmd, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0:
+        if embed:                      # 封面嵌入失败就退回不带封面的转码
+            return encode(raw_path, out_path, meta, bitrate, keep_lossless, None)
         return False, (r.stderr or "").strip()[-400:]
     return True, ""
