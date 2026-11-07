@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name netease-ncm2mp3 --hidden-import Crypto.Cipher.AES --exclude-module numpy --exclude-module pandas --exclude-module matplotlib app.py
+
+      - name: Download ffmpeg
+        run: |
+          curl -L -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ff
+          $exe = Get-ChildItem -Recurse -Filter ffmpeg.exe ff | Select-Object -First 1
+          Copy-Item $exe.FullName dist\ffmpeg.exe
+
+      - name: Package
+        run: |
+          Compress-Archive -Path dist\netease-ncm2mp3.exe, dist\ffmpeg.exe -DestinationPath netease-ncm2mp3-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netease-ncm2mp3-win64
+          path: netease-ncm2mp3-win64.zip
